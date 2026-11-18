@@ -1,6 +1,6 @@
 # Reddit / group post (English)
 
-**Title:** I made eGPU Manager — plug-and-play eGPU for SteamOS handhelds (Decky plugin + Desktop app, auto switch, per-GPU shaders, safe disconnect)
+**Title:** eGPU Manager: plug-and-play eGPU for SteamOS handhelds (free Decky plugin + desktop app)
 
 ---
 
@@ -23,4 +23,4 @@ AMD cards only (NVIDIA isn't supported on SteamOS).
 
 GitHub + download: https://github.com/avishai0258/steamos-egpu-manager
 
-Feedback welcome! If it helps you, you can buy me a coffee: https://www.buymeacoffee.com/Avishai0258
+Feedback welcome!
