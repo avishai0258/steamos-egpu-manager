@@ -54,6 +54,10 @@ const shaderGames = callable<[], ShaderGames>("shader_games");
 const shaderDelete = callable<[string, string], Result>("shader_delete");
 type Report = { ok: boolean; url?: string; file?: string; message?: string };
 const makeReport = callable<[string], Report>("report");
+type UpdateInfo = { ok: boolean; current?: string; latest?: string; available?: boolean; message?: string };
+const updateCheck = callable<[], UpdateInfo>("update_check");
+const doUpdate = callable<[], Result>("update");
+const fixLaunchLoops = callable<[], Result>("fix_launch_loops");
 
 let lastPage: Page = "main"; // reopen the panel on the page you left
 
@@ -74,6 +78,7 @@ function Content() {
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [checks, setChecks] = useState<Check[] | null>(null);
+  const [upd, setUpd] = useState<UpdateInfo | null>(null);
   const [page, setPage] = useState<Page>(lastPage);
   const go = (p: Page) => {
     lastPage = p;
@@ -100,6 +105,15 @@ function Content() {
     };
   }, []);
 
+  // Quietly look for a new release when the Settings page opens (once per panel open)
+  useEffect(() => {
+    if (page === "settings" && !upd) {
+      updateCheck()
+        .then((u) => alive.current && setUpd(u))
+        .catch(() => {});
+    }
+  }, [page]);
+
   const run = async (label: string, fn: () => Promise<Result>) => {
     setBusy(label);
     setMsg(null);
@@ -125,6 +139,23 @@ function Content() {
     }
   };
 
+  const checkUpdate = async () => {
+    setBusy("Checking for updates");
+    try {
+      const u = await updateCheck();
+      if (alive.current) setUpd(u);
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const update = async () => {
+    setBusy("Updating");
+    const r = await doUpdate();
+    toaster.toast({ title: "eGPU Manager", body: r.message });
+    if (!r.ok && alive.current) setBusy(null);
+  };
+
   const share = async (kind: "works" | "problem") => {
     setBusy(kind);
     try {
@@ -145,6 +176,10 @@ function Content() {
     else if (fix === "authorize") await run("Approving dock", authorize);
     else if (fix === "connect") await run("Connecting", doConnect);
     else if (fix === "reboot") await reboot();
+    else if (fix === "launchloop") {
+      await run("Fixing", fixLaunchLoops);
+      check();
+    }
     check();
   };
 
@@ -231,6 +266,30 @@ function Content() {
           </PanelSectionRow>
         </PanelSection>
 
+        <PanelSection title="Updates">
+          <PanelSectionRow>
+            {upd?.available ? (
+              <ButtonItem
+                layout="below"
+                disabled={!!working}
+                description={`You have ${upd.current}. Downloads the new version from GitHub and restarts Decky.`}
+                onClick={update}
+              >
+                {busy === "Updating" ? "Updating..." : `Update to ${upd.latest}`}
+              </ButtonItem>
+            ) : (
+              <ButtonItem
+                layout="below"
+                disabled={!!working}
+                description={upd ? (upd.ok ? `Version ${upd.current} is the latest.` : upd.message) : "Checks GitHub for a newer version."}
+                onClick={checkUpdate}
+              >
+                {busy === "Checking for updates" ? "Checking..." : "Check for updates"}
+              </ButtonItem>
+            )}
+          </PanelSectionRow>
+        </PanelSection>
+
         <PanelSection title="Share your result">
           <PanelSectionRow>
             <ButtonItem
@@ -259,7 +318,7 @@ function Content() {
             <PanelSectionRow key={`${c.id}-${i}`}>
               {c.fix ? (
                 <ButtonItem layout="below" disabled={!!working} description={`${ICON[c.status]} ${c.label}${c.detail ? ` — ${c.detail}` : ""}`} onClick={() => fixAction(c.fix!)}>
-                  {{ install: "Install", authorize: "Approve dock", connect: "Connect", reboot: "Reboot" }[c.fix] ?? "Fix"}
+                  {{ install: "Install", authorize: "Approve dock", connect: "Connect", reboot: "Reboot", launchloop: "Fix games" }[c.fix] ?? "Fix"}
                 </ButtonItem>
               ) : (
                 <Field description={c.detail || undefined} label={`${ICON[c.status]} ${c.label}`} />

@@ -38,6 +38,7 @@ while :; do
     autosw  "Switch automatically when plugged in: $s"
     shaders "Separate shader cache per GPU: $h"
     doctor  "Check setup / first-time setup"
+    update  "Check for updates"
     works   "It works: share my hardware on GitHub"
     problem "Report a problem on GitHub"
     remove  "Uninstall eGPU Manager (undo all changes)"
@@ -53,6 +54,12 @@ while :; do
     use)        act set USE_EGPU "$(flip "$a")" ;;
     autosw)     act set AUTO_SWITCH "$(flip "$s")" ;;
     shaders)    act set SHADER_SWAP "$(flip "$h")" ;;
+    update)
+      u=$("$CTL" update-check 2>&1); rc=$?
+      if [ $rc -ne 0 ]; then show 1 "$u"
+      elif grep -q "Update available" <<<"$u"; then
+        kdialog --title "$T" --yesno "$u"$'\n\nDownload and install it now? (asks for your password once)' && run update "Downloading the new version..."
+      else show 0 "$u"; fi ;;
     works|problem)
       r=$("$CTL" report "$choice" --json 2>/dev/null)
       url=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<<"$r" 2>/dev/null)
@@ -76,7 +83,9 @@ Also delete the other GPU's saved shaders?" --yes-label "Uninstall + delete them
       esac ;;
     doctor)
       rep=$("$CTL" doctor 2>&1)
-      if grep -q '"fix": "authorize"' <<<"$("$CTL" doctor --json)"; then
+      if grep -q '"fix": "launchloop"' <<<"$("$CTL" doctor --json)"; then
+        kdialog --title "$T" --yesno "$rep"$'\n\nFix the games stuck in a launch-options loop now?' && act fix-launch-loops
+      elif grep -q '"fix": "authorize"' <<<"$("$CTL" doctor --json)"; then
         kdialog --title "$T" --yesno "$rep"$'\n\nApprove the USB4 dock now?' && act authorize
       elif grep -q '"fix": "install"' <<<"$("$CTL" doctor --json)"; then
         kdialog --title "$T" --msgbox "$rep"$'\n\nRun setup.sh from the eGPU Manager folder (or the Decky plugin) to install.'

@@ -25,7 +25,8 @@ Comes as a **Decky plugin** (Game Mode) and a **Desktop Mode app**, with a one-c
 - **Safe disconnect.** Moves Game Mode to the built-in GPU and releases the card in software, then tells you when it's safe to unplug. On today's Linux, pulling the cable while the GPU is in use can freeze the driver until a reboot.
 - **Smooth Desktop Mode.** When the eGPU drives the monitor, KDE itself renders on the eGPU, instead of copying every frame over USB4.
 - **Status at a glance:** which eGPU, how it's connected (USB4 / Thunderbolt and its speed, dock chip, PCIe link), and which monitor is attached.
-- **Check setup** walks through port → dock → cable speed → GPU → driver → monitor, and fixes what it can (for example, approving the USB4 dock).
+- **Check setup** walks through port → dock → cable speed → GPU → driver → monitor, and fixes what it can (for example, approving the USB4 dock). It also catches problems from other plugins, such as games stuck in a **Launch Options** loop, which never start, and offers a one-tap fix.
+- **Updates from inside the plugin.** Settings → **Update** downloads the latest release from GitHub. The Desktop app has **Check for updates** too.
 - **Survives SteamOS updates.** Everything lives in your home folder. The read-only system partition is never touched.
 
 ## Requirements
@@ -79,7 +80,8 @@ From the next start of Game Mode, SteamOS behaves exactly as stock.
 - **Big Picture looks low-res on a 4K TV:** Steam picks its own resolution on external displays. Set it once in **Settings → Display → Resolution**. For games, set **Properties → General → Game Resolution → Native**.
 - **The eGPU can drop off the bus** under some loads (`amdgpu: device lost from bus` in the log). This is a driver or USB4-link issue, not this tool. If it happens often, check the dock's power supply and use a short, certified 40 Gb/s cable. The plugin detects it and offers a reboot.
 - **Never force-restart while Steam shows "Installing update".** That breaks Steam's own files, and the next start takes several minutes while Steam repairs itself.
-- If a game won't start after you've been switching GPUs, look for a clash between other launch-option plugins first: several Decky plugins rewrite games' launch options.
+- **A game won't start at all?** Run **Check setup**. The *Launch Options* plugin can save itself into a game's launch options, so every launch loops forever. Check setup detects this and fixes it.
+- **Using LSFG (Lossless Scaling frame generation) on the eGPU?** If you see stutter or strange lines, try turning LSFG off for that game. A desktop card rarely needs it.
 
 ## Command line
 
@@ -92,6 +94,7 @@ From the next start of Game Mode, SteamOS behaves exactly as stock.
 ~/.local/share/egpu-auto/egpu-ctl doctor          # check the whole setup
 ~/.local/share/egpu-auto/egpu-ctl shader-games    # shaders per game and GPU (JSON)
 ~/.local/share/egpu-auto/egpu-ctl report          # hardware report for sharing
+~/.local/share/egpu-auto/egpu-ctl update          # install the latest release from GitHub
 journalctl --user -b | grep egpu-auto             # logs
 ```
 

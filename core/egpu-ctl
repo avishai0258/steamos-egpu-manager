@@ -19,6 +19,8 @@ User commands:
   shader-swap igpu|egpu|desktop   activate a GPU's shader cache (only while Steam is not running)
   sync [--settle]          restart Game Mode if it runs on the wrong GPU (used by the hotplug watcher)
   session-env              KEY=VALUE lines for the Game Mode wrapper
+  update-check / update     check GitHub for a newer release / download and install it
+  fix-launch-loops         repair games stuck in a Launch Options (decky-launch-options) loop
   report [works|problem]   hardware report + link to share it on GitHub (saved to ~/egpu-manager-report.md)
   wait-boot                at session start, wait for an eGPU that is still initialising
 
@@ -28,6 +30,7 @@ Privileged (run as root; called through pkexec or by the Decky backend):
   _authorize               approve (enroll) connected USB4 docks
   _install-plugin <dir>    install the built Decky plugin from <dir> and restart Decky
   _setup <dir>             _authorize + _install-plugin (one password prompt)
+  _update                  download the latest release, install integration + plugin (Decky backend)
   _uninstall-plugin        remove the Decky plugin and restart Decky
 """
 import fcntl
@@ -41,7 +44,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 SELF = os.path.realpath(__file__)
 SYS_PCI = "/sys/bus/pci/devices"
 SYS_TB = "/sys/bus/thunderbolt/devices"
@@ -1107,7 +1110,7 @@ def doctor():
             out.append(_check("gpu", "fail", "Dock found but no graphics card",
                               "Check the card is seated and the dock's power supply is on, then press Connect.",
                               "connect"))
-        return out + [_integration_check()]
+        return out + [_integration_check()] + _other_checks()
     name = gpu_name(d)
     vendor = read(f"{d}/vendor")
     drv = os.path.basename(os.path.realpath(f"{d}/driver")) if os.path.exists(f"{d}/driver") else None
@@ -1129,6 +1132,7 @@ def doctor():
             out.append(_check("monitor", "warn", "No monitor on the eGPU",
                               "Plug the monitor/TV into the graphics card itself, not into the handheld."))
     out.append(_integration_check())
+    out += _other_checks()
     return out
 
 
@@ -1177,6 +1181,100 @@ def install_decky_plugin(src):
     os.rename(tmp, dest)
     subprocess.run(["systemctl", "restart", "plugin_loader.service"], env=SAFE_ENV)
     return 0
+
+
+# ---------------------------------------------------------------- problems from other plugins
+DLO_SETTINGS = os.path.join(HOME, ".dlo", "settings.json")
+
+
+def _dlo_loops():
+    """Games whose "Launch Options" (decky-launch-options) profile wraps the launcher in itself.
+    Each launch then re-runs the wrapper forever and the game never starts."""
+    try:
+        with open(DLO_SETTINGS) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None, []
+    bad = [a for a, p in (d.get("profiles") or {}).items()
+           if isinstance(p, dict) and ".dlo/run" in str(p.get("originalLaunchOptions", ""))]
+    return d, bad
+
+
+def fix_launch_loops():
+    d, bad = _dlo_loops()
+    if not bad:
+        return "No launch-option loops found."
+    import shutil
+    shutil.copy2(DLO_SETTINGS, DLO_SETTINGS + f".bak-{int(time.time())}")
+    for a in bad:
+        p = d["profiles"][a]
+        p["originalLaunchOptions"] = re.sub(r"\s*\S*\.dlo/run\s*", " ", p["originalLaunchOptions"]).strip()
+    tmp = DLO_SETTINGS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=4)
+    os.replace(tmp, DLO_SETTINGS)
+    return f"Fixed launch options of {len(bad)} game(s). A backup was kept next to ~/.dlo/settings.json."
+
+
+def _other_checks():
+    out = []
+    _, bad = _dlo_loops()
+    if bad:
+        names = _game_names()
+        out.append(_check("launchloop", "fail", f"{len(bad)} game(s) can't start (Launch Options loop)",
+                          "The Launch Options plugin saved itself into these games' launch options: "
+                          + ", ".join(names.get(a, a) for a in bad[:5]) + ("..." if len(bad) > 5 else ""),
+                          "launchloop"))
+    try:
+        shm = sum(os.path.getsize(f) for f in glob.glob(f"/dev/shm/u{USER.pw_uid}-Shm_*"))
+        if shm > 2e9 and not steam_running():
+            out.append(_check("shm", "warn", f"{shm / 1e9:.1f} GB of leftover Steam memory",
+                              "Cleared automatically the next time Game Mode starts."))
+    except OSError:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------- updates from GitHub
+def _vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def update_check():
+    r = subprocess.run(["curl", "-fsSL", "--max-time", "20", "-H", "Accept: application/vnd.github+json",
+                        f"https://api.github.com/repos/{REPO}/releases/latest"],
+                       capture_output=True, text=True, env=SAFE_ENV)
+    if r.returncode != 0:
+        raise CtlError("Couldn't reach GitHub. Check the internet connection.")
+    rel = json.loads(r.stdout)
+    latest = (rel.get("tag_name") or "").lstrip("v")
+    asset = next((a["browser_download_url"] for a in rel.get("assets", [])
+                  if a.get("name") == "eGPU-Manager.zip"), None)
+    if not latest or not asset or not asset.startswith(f"https://github.com/{REPO}/releases/download/"):
+        raise CtlError("No release found on GitHub.")
+    return {"ok": True, "current": VERSION, "latest": latest, "url": asset,
+            "available": _vtuple(latest) > _vtuple(VERSION), "notes": (rel.get("body") or "")[:1500]}
+
+
+def update_download():
+    """Download and unpack the latest release. Returns the folder holding the new version."""
+    import tempfile, zipfile
+    info = update_check()
+    tmp = tempfile.mkdtemp(prefix="egpu-update-")
+    z = os.path.join(tmp, "release.zip")
+    r = subprocess.run(["curl", "-fsSL", "--max-time", "120", "-o", z, info["url"]], env=SAFE_ENV)
+    if r.returncode != 0:
+        raise CtlError("Download failed.")
+    root = os.path.realpath(os.path.join(tmp, "x"))
+    with zipfile.ZipFile(z) as zf:
+        for m in zf.namelist():
+            if not os.path.realpath(os.path.join(root, m)).startswith(root + os.sep):
+                raise CtlError("Bad release archive.")
+        zf.extractall(root)
+    src = os.path.join(root, "eGPU Manager")
+    if not os.path.isfile(os.path.join(src, "plugin.json")) or not os.path.isfile(os.path.join(src, "install.sh")):
+        raise CtlError("Bad release archive.")
+    return info, src
 
 
 # ---------------------------------------------------------------- hardware report
@@ -1255,6 +1353,17 @@ def main_priv(args):
         return install_decky_plugin(args[1])
     if args[:1] == ["_install-plugin"] and len(args) == 2:
         return install_decky_plugin(args[1])
+    if args[:1] == ["_update"]:
+        info, src = update_download()
+        os.chown(os.path.dirname(os.path.dirname(src)), USER.pw_uid, USER.pw_gid)
+        for dp, dn, fn in os.walk(os.path.dirname(os.path.dirname(src))):
+            for x in dn + fn:
+                os.chown(os.path.join(dp, x), USER.pw_uid, USER.pw_gid)
+        # integration first (as the user), then the plugin (restarts Decky, ending this process's caller)
+        subprocess.run(["runuser", "-u", USER.pw_name, "--", "env", f"HOME={HOME}", f"XDG_RUNTIME_DIR={RUNTIME}", "/bin/bash",
+                        os.path.join(src, "install.sh")], env=SAFE_ENV)
+        print(json.dumps({"ok": True, "message": f"Updated to {info['latest']}. Decky restarts now."}), flush=True)
+        return install_decky_plugin(src)
     if args[:1] == ["_uninstall-plugin"]:
         return uninstall_decky_plugin()
     if args[:1] == ["_rescan"]:
@@ -1344,6 +1453,22 @@ def main(argv):
                 msg = backlight(argv[1])
             except OSError as e:
                 raise CtlError(f"Can't change the backlight: {e}")
+        elif cmd == "update-check":
+            r = update_check()
+            print(json.dumps(r) if as_json else
+                  (f"Update available: {r['current']} -> {r['latest']}" if r["available"] else f"Up to date ({r['current']})."))
+            return 0
+        elif cmd == "update":
+            info, src = update_download()
+            if not info["available"] and "--force" not in argv:
+                msg = f"Already up to date ({VERSION})."
+            else:
+                subprocess.run(["/bin/bash", os.path.join(src, "install.sh")], check=True)
+                if os.path.isdir(os.path.join(HOME, "homebrew", "plugins")):
+                    subprocess.run(["pkexec", os.path.join(src, "core", "egpu-ctl"), "_install-plugin", src])
+                msg = f"Updated to {info['latest']}."
+        elif cmd == "fix-launch-loops":
+            msg = fix_launch_loops()
         elif cmd == "report":
             r = report(argv[1] if len(argv) > 1 and argv[1] in ("works", "problem") else "works")
             print(json.dumps(r) if as_json else f"{r['title']}\n\n{r['body']}\n\nSaved to {r['file']}\nShare it: {r['url'][:80]}...")

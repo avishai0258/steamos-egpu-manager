@@ -221,18 +221,35 @@ class Plugin:
     async def shader_delete(self, appid: str, profile: str):
         return await _ctl_json("shader-delete", str(appid), str(profile))
 
-    async def report(self, kind: str):
-        # Runs as the user: the log lives in the user's journal and the report file in their home.
-        if kind not in ("works", "problem"):
-            return {"ok": False, "message": "invalid"}
+    async def _ctl_user(self, *args, timeout=60):
+        # Runs egpu-ctl as the user: files in their home stay theirs, and their journal is readable.
         uid = os.stat(decky.DECKY_USER_HOME).st_uid
         rc, out, err = await _run(
             "runuser", "-u", decky.DECKY_USER, "--", "env", f"HOME={decky.DECKY_USER_HOME}",
-            f"XDG_RUNTIME_DIR=/run/user/{uid}", "/usr/bin/python3", "-I", CTL, "report", kind, "--json", timeout=60)
+            f"XDG_RUNTIME_DIR=/run/user/{uid}", "/usr/bin/python3", "-I", CTL, *args, "--json", timeout=timeout)
         try:
             return json.loads(out)
         except ValueError:
-            return {"ok": False, "message": (err or out).strip()[-300:] or "report failed"}
+            return {"ok": False, "message": (err or out).strip()[-300:] or f"{args[0]} failed"}
+
+    async def report(self, kind: str):
+        if kind not in ("works", "problem"):
+            return {"ok": False, "message": "invalid"}
+        return await self._ctl_user("report", kind)
+
+    async def fix_launch_loops(self):
+        return await self._ctl_user("fix-launch-loops")
+
+    async def update_check(self):
+        return await _ctl_json("update-check")
+
+    async def update(self):
+        # Outside Decky's own service: installing the new plugin restarts Decky.
+        rc, out, err = await _run("systemd-run", "--collect", "--quiet", "--unit", "egpu-manager-update",
+                                  "/usr/bin/python3", "-I", CTL, "_update")
+        if rc != 0:
+            return {"ok": False, "message": (err or out).strip()[-300:] or "update failed to start"}
+        return {"ok": True, "message": "Updating... Decky restarts in a few seconds."}
 
     async def set_auto(self, enabled: bool):
         return await _ctl_json("auto", "on" if enabled else "off")
