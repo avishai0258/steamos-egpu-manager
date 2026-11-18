@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=eGPU Manager - First-time setup
+Comment=Approve the eGPU dock, install the Decky plugin and the Game Mode integration
+Exec=sh -c 'cd "$(dirname "$1")" && konsole --hold -e ./setup.sh' _ %k
+Icon=video-display
+Terminal=false

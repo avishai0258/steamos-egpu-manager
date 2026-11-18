@@ -1,0 +1,11 @@
+{
+  "name": "eGPU Manager",
+  "author": "avishai0258",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["egpu", "gpu", "hardware", "usb4", "thunderbolt"],
+    "description": "See your external GPU, how it is connected, and connect / safely disconnect it from Game Mode.",
+    "image": ""
+  }
+}

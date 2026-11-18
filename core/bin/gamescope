@@ -1,0 +1,4 @@
+#!/bin/bash
+# Only on PATH in eGPU mode: make gamescope composite/scan out on the eGPU.
+PATH="${PATH#$HOME/.local/share/egpu-auto/bin:}"
+exec /usr/bin/gamescope --prefer-vk-device "$EGPU_VK_ID" "$@"

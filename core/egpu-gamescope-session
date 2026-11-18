@@ -1,0 +1,53 @@
+#!/bin/bash
+# Wraps SteamOS gamescope-session: runs Game Mode on the eGPU when one with a monitor is attached,
+# and swaps in that GPU's shader cache before Steam starts.
+# If anything here fails, Game Mode still starts normally on the built-in GPU.
+D="$HOME/.local/share/egpu-auto"
+CTL="$D/egpu-ctl"
+MODE=igpu PROFILE=igpu EGPU_SLOT= EGPU_VK_ID= IGPU_SLOT= IGPU_VK_ID=
+
+"$CTL" wait-boot 2>/dev/null
+while IFS='=' read -r k v; do
+  case $k in MODE|PROFILE|EGPU_SLOT|EGPU_VK_ID|IGPU_SLOT|IGPU_VK_ID) printf -v "$k" '%s' "$v" ;; esac
+done < <("$CTL" session-env 2>/dev/null)
+
+id_ok() { [[ $1 =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]]; }
+slot_ok() { [[ $1 =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]; }
+
+if [ "$MODE" = egpu ] && id_ok "$EGPU_VK_ID" && slot_ok "$EGPU_SLOT"; then
+  export EGPU_VK_ID
+  export DRI_PRIME="pci-${EGPU_SLOT//[:.]/_}"     # OpenGL games
+  export MESA_VK_DEVICE_SELECT="$EGPU_VK_ID"     # Vulkan / Proton games
+  export PATH="$D/bin:$PATH"                     # gamescope wrapper: composite + scan out on the eGPU
+  echo "[egpu-auto] using eGPU $EGPU_SLOT ($EGPU_VK_ID)" >&2
+else
+  MODE=igpu
+  if id_ok "$IGPU_VK_ID" && slot_ok "$IGPU_SLOT"; then
+    # An eGPU is attached but not in use: keep Steam and games on the built-in GPU
+    export DRI_PRIME="pci-${IGPU_SLOT//[:.]/_}"
+    export MESA_VK_DEVICE_SELECT="$IGPU_VK_ID"
+  fi
+  PROFILE=igpu
+fi
+# Steam leaks its shared-memory files whenever it is killed (every Game Mode restart); they pile up
+# in RAM and eventually make games crash at launch (SIGBUS). Steam isn't running yet: clear them.
+pgrep -u "$(id -u)" -x steam >/dev/null || rm -f /dev/shm/u"$(id -u)"-Shm_* 2>/dev/null
+
+# Keep plenty of compiled shaders (Mesa's default limit of 1 GB evicts them)
+export MESA_SHADER_CACHE_MAX_SIZE="${MESA_SHADER_CACHE_MAX_SIZE:-10G}"
+"$CTL" shader-swap "$PROFILE" >/dev/null 2>&1 || echo "[egpu-auto] shader cache not switched" >&2
+
+# The handheld panel isn't driven by gamescope on the eGPU, so it would stay lit and black
+if [ "$MODE" = egpu ]; then "$CTL" backlight off >/dev/null 2>&1; else "$CTL" backlight restore >/dev/null 2>&1; fi
+
+echo "$MODE" > "$XDG_RUNTIME_DIR/egpu-auto.mode"
+echo "[egpu-auto] session mode: $MODE" >&2
+
+# The Decky plugin switches the handheld panel off while on the eGPU; it turns it back on within a
+# second of this file saying igpu. Wait for that so gamescope finds the panel.
+if [ "$MODE" = igpu ] && [ -e /run/egpu-manager-edp-off ]; then
+  for _ in $(seq 50); do [ -e /run/egpu-manager-edp-off ] || break; sleep 0.1; done
+  sleep 0.5
+fi
+
+exec /usr/lib/steamos/gamescope-session "$@"

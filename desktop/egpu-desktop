@@ -1,0 +1,87 @@
+#!/bin/bash
+# eGPU Manager for Desktop Mode: same status and controls as the Decky plugin.
+CTL="$HOME/.local/share/egpu-auto/egpu-ctl"
+T="eGPU Manager"
+show() {  # $1 = rc, $2 = text
+  local out; out=$(grep -v '^\[egpu-auto\]' <<<"$2")
+  if [ "$1" -eq 0 ]; then kdialog --title "$T" --msgbox "$out"; else kdialog --title "$T" --error "$out"; fi
+}
+run() {  # run a long action with a progress popup
+  local out rc
+  kdialog --title "$T" --passivepopup "$2" 5 2>/dev/null &
+  out=$("$CTL" "${@:3}" "$1" 2>&1); rc=$?
+  show $rc "$out"
+}
+act() { local out rc; out=$("$CTL" "$@" 2>&1); rc=$?; show $rc "$out"; }
+onoff() { grep -q "\"$1\": true" <<<"$json" && echo on || echo off; }
+flip() { [ "$1" = on ] && echo off || echo on; }
+
+while :; do
+  st=$("$CTL" status 2>&1)
+  json=$("$CTL" status --json 2>/dev/null)
+  items=()
+  if grep -q '"state": "connected"' <<<"$json"; then
+    items+=(disconnect "Disconnect safely (before unplugging)")
+    if grep -q '"choice": "igpu"' <<<"$json"; then
+      items+=(to-egpu "Game Mode: use the eGPU")
+    else
+      items+=(to-igpu "Game Mode: use the built-in screen")
+    fi
+  elif grep -q '"state": "stuck"' <<<"$json"; then
+    items+=(reboot "Reboot (needed after unplugging during use)")
+  else
+    items+=(connect "Connect eGPU")
+  fi
+  a=$(onoff auto); s=$(onoff auto_switch); h=$(onoff shader_swap)
+  items+=(
+    use     "Use eGPU in Game Mode: $a"
+    autosw  "Switch automatically when plugged in: $s"
+    shaders "Separate shader cache per GPU: $h"
+    doctor  "Check setup / first-time setup"
+    works   "It works: share my hardware on GitHub"
+    problem "Report a problem on GitHub"
+    remove  "Uninstall eGPU Manager (undo all changes)"
+    refresh "Refresh"
+  )
+  choice=$(kdialog --title "$T" --geometry 520x420 --menu "$st" "${items[@]}") || exit 0
+  case $choice in
+    disconnect) run disconnect "Releasing the eGPU... you may be asked for your password." ;;
+    connect)    run connect "Looking for the eGPU... you may be asked for your password." ;;
+    to-egpu)    act switch egpu ;;
+    to-igpu)    act switch igpu ;;
+    reboot)     kdialog --title "$T" --yesno "Reboot now?" && systemctl reboot ;;
+    use)        act set USE_EGPU "$(flip "$a")" ;;
+    autosw)     act set AUTO_SWITCH "$(flip "$s")" ;;
+    shaders)    act set SHADER_SWAP "$(flip "$h")" ;;
+    works|problem)
+      r=$("$CTL" report "$choice" --json 2>/dev/null)
+      url=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<<"$r" 2>/dev/null)
+      if [ -n "$url" ]; then
+        kdialog --title "$T" --msgbox "Your report was saved to ~/egpu-manager-report.md.
+
+Your browser now opens a GitHub post with it. Review it, then press Submit (needs a free GitHub account)."
+        xdg-open "$url" >/dev/null 2>&1 &
+      else
+        show 1 "Could not create the report."
+      fi ;;
+    remove)
+      kdialog --title "$T" --warningyesnocancel "Uninstall eGPU Manager?
+
+Steam closes, its shader cache goes back to the normal folder, and Game Mode, Desktop Mode and the Decky plugin are restored to stock.
+
+Also delete the other GPU's saved shaders?" --yes-label "Uninstall + delete them" --no-label "Uninstall, keep them"
+      case $? in
+        0) "$HOME/.local/share/egpu-auto/uninstall.sh" --purge > /tmp/egpu-uninstall.log 2>&1; show $? "$(cat /tmp/egpu-uninstall.log)"; exit 0 ;;
+        1) "$HOME/.local/share/egpu-auto/uninstall.sh" > /tmp/egpu-uninstall.log 2>&1; show $? "$(cat /tmp/egpu-uninstall.log)"; exit 0 ;;
+      esac ;;
+    doctor)
+      rep=$("$CTL" doctor 2>&1)
+      if grep -q '"fix": "authorize"' <<<"$("$CTL" doctor --json)"; then
+        kdialog --title "$T" --yesno "$rep"$'\n\nApprove the USB4 dock now?' && act authorize
+      elif grep -q '"fix": "install"' <<<"$("$CTL" doctor --json)"; then
+        kdialog --title "$T" --msgbox "$rep"$'\n\nRun setup.sh from the eGPU Manager folder (or the Decky plugin) to install.'
+      else
+        kdialog --title "$T" --msgbox "$rep"
+      fi ;;
+  esac
+done

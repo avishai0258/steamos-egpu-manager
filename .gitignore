@@ -1,0 +1,7 @@
+node_modules/
+decky/out/
+decky/dist/
+__pycache__/
+*.pyc
+docs/promo/*.html
+docs/promo/style.css

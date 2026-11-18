@@ -1,0 +1,9 @@
+#!/bin/bash
+# Game Mode only: when the eGPU or its monitor is plugged/unplugged, restart the session on the right GPU.
+CTL="$HOME/.local/share/egpu-auto/egpu-ctl"
+sleep 10
+"$CTL" sync
+udevadm monitor --udev --subsystem-match=drm --subsystem-match=thunderbolt --subsystem-match=pci | while read -r _; do
+  while read -r -t 3 _; do :; done   # swallow the burst of events
+  "$CTL" sync --settle
+done

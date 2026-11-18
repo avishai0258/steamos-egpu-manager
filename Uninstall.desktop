@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=eGPU Manager - Uninstall
+Comment=Remove eGPU Manager and restore SteamOS to stock
+Exec=sh -c 'cd "$(dirname "$1")" && konsole --hold -e ./uninstall.sh' _ %k
+Icon=edit-delete
+Terminal=false

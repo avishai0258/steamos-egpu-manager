@@ -1,0 +1,1371 @@
+#!/usr/bin/python3 -I
+"""egpu-ctl - detect, connect and safely disconnect an external GPU on SteamOS.
+
+User commands:
+  status [--json|--text]   show what is connected and how
+  connect [--json]         bring a (software-)removed eGPU back and move Game Mode onto it
+  disconnect [--json]      move Game Mode off the eGPU and remove it so the cable can be pulled
+  switch egpu|igpu         run Game Mode on the eGPU or on the built-in screen (eGPU stays plugged in)
+  set KEY on|off           USE_EGPU (use eGPU at all), AUTO_SWITCH (switch when plugged in),
+                           SHADER_SWAP (separate shader cache per GPU)
+  auto on|off              alias for: set USE_EGPU on|off
+  restart                  restart Game Mode on the right GPU
+  doctor                   check the whole setup (first-time install helper)
+  authorize                approve a new USB4 dock
+  shader-info              shader cache profiles and their sizes
+  backlight off|restore    turn the built-in screen off / back on (used by Game Mode on the eGPU)
+  shader-games             per-game shader caches and their sizes per GPU
+  shader-delete APPID PROF delete one game's shaders for a GPU profile (or "all")
+  shader-swap igpu|egpu|desktop   activate a GPU's shader cache (only while Steam is not running)
+  sync [--settle]          restart Game Mode if it runs on the wrong GPU (used by the hotplug watcher)
+  session-env              KEY=VALUE lines for the Game Mode wrapper
+  report [works|problem]   hardware report + link to share it on GitHub (saved to ~/egpu-manager-report.md)
+  wait-boot                at session start, wait for an eGPU that is still initialising
+
+Privileged (run as root; called through pkexec or by the Decky backend):
+  _remove <pci-slot>       remove the eGPU's PCI functions
+  _rescan                  rescan the PCI bus
+  _authorize               approve (enroll) connected USB4 docks
+  _install-plugin <dir>    install the built Decky plugin from <dir> and restart Decky
+  _setup <dir>             _authorize + _install-plugin (one password prompt)
+  _uninstall-plugin        remove the Decky plugin and restart Decky
+"""
+import fcntl
+import glob
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "1.3.0"
+SELF = os.path.realpath(__file__)
+SYS_PCI = "/sys/bus/pci/devices"
+SYS_TB = "/sys/bus/thunderbolt/devices"
+SAFE_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+SLOT_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+
+IS_ROOT = os.geteuid() == 0
+
+
+# ---------------------------------------------------------------- user context
+def _target_user():
+    if not IS_ROOT:
+        return pwd.getpwuid(os.getuid())
+    for key in ("EGPU_USER", "DECKY_USER", "SUDO_USER"):
+        name = os.environ.get(key)
+        if name and name != "root":
+            try:
+                return pwd.getpwnam(name)
+            except KeyError:
+                pass
+    if os.environ.get("PKEXEC_UID"):
+        return pwd.getpwuid(int(os.environ["PKEXEC_UID"]))
+    try:
+        return pwd.getpwnam("deck")
+    except KeyError:
+        return pwd.getpwuid(1000)
+
+
+USER = _target_user()
+HOME = os.environ.get("EGPU_TEST_HOME") or USER.pw_dir   # test override: run against a sandbox home
+RUNTIME = f"/run/user/{USER.pw_uid}"
+CONF = os.path.join(HOME, ".config", "egpu-auto.conf")
+STATE = os.path.join(RUNTIME, "egpu-auto.mode")      # GPU the current Game Mode session runs on
+CHOICE = os.path.join(RUNTIME, "egpu-auto.choice")     # user's pick for this plug-in: "egpu" / "igpu"
+OPFILE = os.path.join(RUNTIME, "egpu-auto.op")         # "<pid> <operation>" while busy
+LOCK = os.path.join(RUNTIME, "egpu-auto.lock")
+INSTALL_DIR = os.path.join(HOME, ".local", "share", "egpu-auto")
+SHADER_DIR = os.path.join(INSTALL_DIR, "shader-state")   # saved Steam ShaderCacheManager blocks
+SHADER_CUR = os.path.join(INSTALL_DIR, "shader-profile")  # profile whose caches are active now
+STEAM = os.path.join(HOME, ".local", "share", "Steam")
+DROPIN = os.path.join(HOME, ".config", "systemd", "user.control",
+                      "gamescope-session.service.d", "50-egpu-auto.conf")
+
+
+def log(msg):
+    print(f"[egpu-auto] {msg}", file=sys.stderr, flush=True)
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write_user_file(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+    if IS_ROOT:
+        os.chown(path, USER.pw_uid, USER.pw_gid)
+
+
+def remove_file(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def user_cmd(args):
+    """Run a command as the session user (with their systemd/D-Bus session)."""
+    env = dict(SAFE_ENV, HOME=HOME, USER=USER.pw_name, XDG_RUNTIME_DIR=RUNTIME,
+               DBUS_SESSION_BUS_ADDRESS=f"unix:path={RUNTIME}/bus")
+    if IS_ROOT:
+        args = ["runuser", "-u", USER.pw_name, "--", "env"] + \
+               [f"{k}={v}" for k, v in env.items()] + list(args)
+        env = SAFE_ENV
+    return subprocess.run(args, env=env, capture_output=True, text=True)
+
+
+def priv(*args):
+    """Run a privileged sub-command of this script (directly as root, else via pkexec)."""
+    if IS_ROOT:
+        return main_priv(list(args))
+    r = subprocess.run(["pkexec", SELF] + list(args), capture_output=True, text=True)
+    if r.returncode in (126, 127):
+        raise CtlError("Administrator permission was not granted.")
+    if r.returncode != 0:
+        raise CtlError((r.stderr or r.stdout).strip() or "privileged step failed")
+    return 0
+
+
+class CtlError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- config
+def conf():
+    c = {"USE_EGPU": "1", "AUTO_SWITCH": "1", "SHADER_SWAP": "1", "WAIT_SECS": "15"}
+    for line in (read(CONF, "") or "").splitlines():
+        m = re.match(r"^\s*([A-Z_]+)\s*=\s*\"?([^\"#]*)\"?", line)
+        if m:
+            c[m.group(1)] = m.group(2).strip()
+    return c
+
+
+def set_conf(key, value):
+    lines = (read(CONF, "") or "# egpu-auto settings\n").splitlines()
+    out, done = [], False
+    for line in lines:
+        if re.match(rf"^\s*{key}\s*=", line):
+            out.append(f"{key}={value}")
+            done = True
+        else:
+            out.append(line)
+    if not done:
+        out.append(f"{key}={value}")
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    write_user_file(CONF, "\n".join(out) + "\n")
+
+
+# ---------------------------------------------------------------- detection
+def find_egpu():
+    """sysfs path of the external GPU (non-boot display controller), preferring hot-pluggable ones."""
+    cands = []
+    for d in sorted(glob.glob(f"{SYS_PCI}/*")):
+        if not (read(f"{d}/class", "") or "").startswith("0x03"):
+            continue
+        if read(f"{d}/boot_vga") == "1":
+            continue
+        cands.append(d)
+    cands.sort(key=lambda d: read(f"{d}/removable") != "removable")
+    return cands[0] if cands else None
+
+
+def device_lost(d):
+    """True when the device is still registered but no longer answers (cable pulled while in use)."""
+    try:
+        with open(f"{d}/config", "rb") as f:
+            return f.read(4) == b"\xff\xff\xff\xff"
+    except OSError:
+        return True
+
+
+def pciehp_stuck():
+    """A PCIe hotplug thread stuck in D state means the kernel cannot see new devices until reboot."""
+    def stuck_threads():
+        found = set()
+        for stat in glob.glob("/proc/[0-9]*/stat"):
+            s = read(stat, "")
+            m = re.match(r"^(\d+) \((.*)\) (\S)", s or "")
+            if m and m.group(3) == "D" and re.fullmatch(r"irq/\d+-pciehp", m.group(2)):
+                found.add(m.group(1))
+        return found
+    first = stuck_threads()
+    if not first:
+        return False
+    time.sleep(0.3)
+    return bool(first & stuck_threads())
+
+
+def gpu_name(d):
+    slot = os.path.basename(d)
+    try:
+        r = subprocess.run(["lspci", "-mm", "-s", slot], capture_output=True, text=True, env=SAFE_ENV)
+        fields = re.findall(r'"([^"]*)"', r.stdout)
+        if len(fields) >= 3:
+            dev = fields[2]
+            m = re.search(r"\[([^\]]+)\]", dev)
+            vendor = fields[1]
+            vshort = "AMD" if "AMD" in vendor else vendor.split()[0]
+            return f"{vshort} {m.group(1) if m else dev}"
+    except OSError:
+        pass
+    return f"GPU {read(f'{d}/vendor')}:{read(f'{d}/device')}"
+
+
+def edid_name(path):
+    try:
+        with open(path, "rb") as f:
+            e = f.read(128)
+    except OSError:
+        return None
+    for off in (54, 72, 90, 108):
+        blk = e[off:off + 18]
+        if len(blk) == 18 and blk[:3] == b"\0\0\0" and blk[3] == 0xFC:
+            return blk[5:].split(b"\n")[0].decode("ascii", "ignore").strip() or None
+    return None
+
+
+def drm_nodes(d):
+    card = next(iter(glob.glob(f"{d}/drm/card*")), None)
+    render = next(iter(glob.glob(f"{d}/drm/renderD*")), None)
+    return card, render
+
+
+def monitors(card):
+    out = []
+    if not card:
+        return out
+    for c in sorted(glob.glob(f"{card}/card*-*")):
+        if "Writeback" in c or read(f"{c}/status") != "connected":
+            continue
+        conn = os.path.basename(c).split("-", 1)[1]
+        out.append({"connector": conn, "name": edid_name(f"{c}/edid") or conn})
+    return out
+
+
+def tb_peripherals():
+    out = []
+    for p in sorted(glob.glob(f"{SYS_TB}/*")):
+        n = os.path.basename(p)
+        if not re.fullmatch(r"\d+-[1-9]\d*", n):
+            continue
+        out.append(p)
+    return out
+
+
+def _gbps(speed, lanes):
+    m = re.match(r"([\d.]+)", speed or "")
+    if not m:
+        return None
+    return float(m.group(1)) * int(lanes or 1)
+
+
+def interface_info(d):
+    if read(f"{d}/removable") != "removable":
+        return {"type": "PCIe", "label": "PCIe / OCuLink", "device": None, "gbps": None}
+    tbs = tb_peripherals()
+    if not tbs:
+        return {"type": "External", "label": "External PCIe", "device": None, "gbps": None}
+    p = tbs[0]
+    gen = read(f"{p}/generation", "")
+    kind = {"4": "USB4", "3": "Thunderbolt 3", "2": "Thunderbolt 2", "1": "Thunderbolt"}.get(gen, "Thunderbolt")
+    gbps = _gbps(read(f"{p}/rx_speed"), read(f"{p}/rx_lanes"))
+    dev = " ".join(x for x in (read(f"{p}/vendor_name"), read(f"{p}/device_name")) if x) or None
+    if dev and read(f"{p}/vendor_name") and (read(f"{p}/device_name") or "").startswith(read(f"{p}/vendor_name")):
+        dev = read(f"{p}/device_name")
+    label = f"{kind} · {gbps:g} Gb/s" if gbps else kind
+    return {"type": kind, "label": label, "device": dev, "gbps": gbps}
+
+
+def pcie_link(d):
+    cur, w = read(f"{d}/current_link_speed"), read(f"{d}/current_link_width")
+    if not cur or not w:
+        return None
+    return f"{cur.replace(' PCIe', '')} x{w}"
+
+
+def session_type():
+    r = user_cmd(["systemctl", "--user", "is-active", "gamescope-session.service"])
+    if r.stdout.strip() == "active":
+        return "game"
+    r = subprocess.run(["pgrep", "-u", str(USER.pw_uid), "-x", "kwin_wayland"], capture_output=True, env=SAFE_ENV)
+    return "desktop" if r.returncode == 0 else "none"
+
+
+def holders(nodes):
+    devs = {f"/dev/dri/{os.path.basename(n)}" for n in nodes if n}
+    names = set()
+    for fd in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            if os.readlink(fd) in devs:
+                pid = fd.split("/")[2]
+                names.add(read(f"/proc/{pid}/comm", "?"))
+        except OSError:
+            continue
+    names.discard("egpu-ctl")
+    return sorted(names)
+
+
+def busy_op():
+    s = read(OPFILE)
+    if not s:
+        return None
+    pid, _, op = s.partition(" ")
+    if pid.isdigit() and os.path.exists(f"/proc/{pid}"):
+        return op
+    return None
+
+
+def want_mode(d=None, have=None):
+    """Which GPU Game Mode should be on right now."""
+    c = conf()
+    choice = read(CHOICE)
+    if c.get("USE_EGPU") != "1" or choice == "igpu":
+        return "igpu"
+    if choice != "egpu" and c.get("AUTO_SWITCH") != "1":
+        # Not switching automatically: stay where we are until the user presses Switch.
+        have = have if have is not None else read(STATE)
+        if have != "egpu":
+            return "igpu"
+    d = d or find_egpu()
+    if not d or device_lost(d):
+        return "igpu"
+    card, _ = drm_nodes(d)
+    if not card:
+        return "igpu"
+    if monitors(card):
+        return "egpu"
+    # Hysteresis: stay on a healthy eGPU when its monitor blinks off (TV standby, mode change).
+    have = have if have is not None else read(STATE)
+    return "egpu" if have == "egpu" else "igpu"
+
+
+def status():
+    d = find_egpu()
+    st = {
+        "version": VERSION,
+        "state": "absent",
+        "gpu": None,
+        "interface": None,
+        "monitors": [],
+        "session": session_type(),
+        "session_gpu": read(STATE),
+        "auto": conf().get("USE_EGPU") == "1",
+        "choice": read(CHOICE),
+        "auto_switch": conf().get("AUTO_SWITCH") == "1",
+        "shader_swap": conf().get("SHADER_SWAP") == "1",
+        "shader_profile": read(SHADER_CUR),
+        "integration": os.path.exists(DROPIN),
+        "installed_version": read(os.path.join(INSTALL_DIR, "VERSION")),
+        "busy": busy_op(),
+        "dock_attached": bool(tb_peripherals()),
+    }
+    if st["session"] != "game":
+        st["session_gpu"] = None
+    if d:
+        card, render = drm_nodes(d)
+        lost = device_lost(d)
+        drv = os.path.basename(os.path.realpath(f"{d}/driver")) if os.path.exists(f"{d}/driver") else None
+        st["gpu"] = {
+            "name": gpu_name(d),
+            "slot": os.path.basename(d),
+            "id": f"{(read(f'{d}/vendor') or '')[2:]}:{(read(f'{d}/device') or '')[2:]}",
+            "driver": drv,
+            "link": None if lost else pcie_link(d),
+        }
+        st["interface"] = interface_info(d)
+        if lost or pciehp_stuck():
+            st["state"] = "stuck"
+        elif card:
+            st["state"] = "connected"
+            st["monitors"] = monitors(card)
+        else:
+            st["state"] = "no_driver"
+    else:
+        if pciehp_stuck():
+            st["state"] = "stuck"
+        elif st["dock_attached"]:
+            st["state"] = "removed"
+    st["want"] = want_mode(d)
+    return st
+
+
+def status_text(st):
+    lines = []
+    label = {
+        "connected": "Connected",
+        "removed": "Disconnected in software - safe to unplug, or press Connect",
+        "absent": "No eGPU detected",
+        "stuck": "The eGPU was unplugged while in use. Reboot to use it again.",
+        "no_driver": "Detected, but no driver is loaded",
+    }[st["state"]]
+    lines.append(f"Status: {label}")
+    if st["gpu"]:
+        lines.append(f"GPU: {st['gpu']['name']} ({st['gpu']['slot']})")
+    if st["interface"]:
+        i = st["interface"]
+        lines.append(f"Interface: {i['label']}" + (f" - {i['device']}" if i["device"] else ""))
+    if st["gpu"] and st["gpu"]["link"]:
+        lines.append(f"PCIe link: {st['gpu']['link']}")
+    if st["state"] == "connected":
+        mons = ", ".join(f"{m['name']} ({m['connector']})" for m in st["monitors"]) or "none"
+        lines.append(f"Monitor on eGPU: {mons}")
+    if st["session"] == "game":
+        lines.append(f"Game Mode runs on: {'eGPU' if st['session_gpu'] == 'egpu' else 'built-in GPU'}")
+    lines.append(f"Use eGPU automatically: {'on' if st['auto'] else 'off'}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- session control
+class Lock:
+    def __enter__(self):
+        self.f = open(LOCK, "a")
+        if IS_ROOT:
+            os.chown(LOCK, USER.pw_uid, USER.pw_gid)
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def restart_game_mode(reason):
+    """Restart Game Mode. gamescope-session.service refuses a manual (re)start, so go through
+    steamos-manager (same path as the Steam UI); fall back to stopping it and letting SDDM relogin."""
+    log(f"{reason}: restarting Game Mode")
+    r = user_cmd(["steamosctl", "switch-to-game-mode"])
+    if r.returncode != 0:
+        log(f"steamosctl failed ({r.returncode}): {(r.stderr or r.stdout).strip()}; stopping the session instead")
+        r = user_cmd(["systemctl", "--user", "--no-block", "stop", "gamescope-session.service"])
+        if r.returncode != 0:
+            raise CtlError("Could not restart Game Mode: " + (r.stderr or r.stdout).strip())
+
+
+def restart_session():
+    if session_type() != "game":
+        raise CtlError("Game Mode is not running.")
+    with Lock():
+        want = want_mode(have="")
+        write_user_file(STATE, want + "\n")
+        restart_game_mode("restart requested")
+    return "Restarting Game Mode on the " + ("eGPU." if want == "egpu" else "built-in GPU.")
+
+
+def sync(settle=False):
+    """Restart Game Mode if it is on the wrong GPU. Returns True if a restart was issued."""
+    if session_type() != "game":
+        return False
+    if settle:
+        first = want_mode()
+        time.sleep(3)
+        if want_mode() != first:
+            return False
+    try:  # session just (re)started: let it settle before switching again
+        time.sleep(max(0.0, 15 - (time.time() - os.path.getmtime(STATE))))
+    except OSError:
+        pass
+    if not find_egpu():
+        remove_file(CHOICE)  # a new plug-in starts fresh
+    with Lock():
+        have = read(STATE)
+        want = want_mode(have=have)
+        if not have or have == want:
+            return False
+        write_user_file(STATE, want + "\n")
+        restart_game_mode(f"change detected ({have} -> {want})")
+        return True
+
+
+def wait_session(want, timeout=40):
+    """Wait until Game Mode is back up on the wanted GPU."""
+    end = time.time() + timeout
+    time.sleep(3)
+    while time.time() < end:
+        if session_type() == "game" and read(STATE) == want:
+            r = subprocess.run(["pgrep", "-u", str(USER.pw_uid), "-f", "gamescope"], capture_output=True, env=SAFE_ENV)
+            if r.returncode == 0:
+                return True
+        time.sleep(1)
+    return False
+
+
+class Op:
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        if busy_op():
+            raise CtlError(f"Another operation is running ({busy_op()}).")
+        write_user_file(OPFILE, f"{os.getpid()} {self.name}\n")
+
+    def __exit__(self, *a):
+        remove_file(OPFILE)
+
+
+def disconnect():
+    d = find_egpu()
+    if not d:
+        if pciehp_stuck():
+            raise CtlError("The eGPU was unplugged while in use. Reboot to use it again.")
+        return "No eGPU is connected - safe to unplug."
+    if device_lost(d):
+        raise CtlError("The eGPU is no longer responding. Reboot to use it again.")
+    slot = os.path.basename(d)
+    with Op("disconnect"):
+        write_user_file(CHOICE, "igpu\n")
+        sess = session_type()
+        if sess == "game" and read(STATE) == "egpu":
+            with Lock():
+                write_user_file(STATE, "igpu\n")
+                restart_game_mode("safe disconnect requested")
+            if not wait_session("igpu"):
+                log("Game Mode did not come back in time; continuing")
+        card, render = drm_nodes(d)
+        # Give apps a moment to let go of the card (Desktop Mode compositors may keep it open).
+        end = time.time() + (10 if sess == "game" else 3)
+        while time.time() < end and holders([card]):
+            time.sleep(0.5)
+        left = holders([card, render])
+        if left:
+            log(f"still open by: {', '.join(left)} (removing anyway)")
+        priv("_remove", slot)
+        for _ in range(20):
+            if not os.path.exists(f"{SYS_PCI}/{slot}"):
+                break
+            time.sleep(0.5)
+        remove_file(CHOICE)
+        if os.path.exists(f"{SYS_PCI}/{slot}"):
+            raise CtlError("The system did not release the eGPU. Do not unplug; try again.")
+    log(f"eGPU {slot} removed")
+    return "eGPU disconnected. It is now safe to unplug the cable."
+
+
+def connect():
+    write_user_file(CHOICE, "egpu\n")
+    d = find_egpu()
+    if d and device_lost(d):
+        raise CtlError("The eGPU was unplugged while in use. Reboot to use it again.")
+    with Op("connect"):
+        if not d:
+            if pciehp_stuck():
+                raise CtlError("The eGPU was unplugged while in use. Reboot to use it again.")
+            priv("_rescan")
+            for _ in range(30):
+                d = find_egpu()
+                if d and drm_nodes(d)[0]:
+                    break
+                time.sleep(0.5)
+        if not d:
+            if tb_peripherals():
+                raise CtlError("The dock is connected, but no graphics card appeared. Check the eGPU's power and try again.")
+            raise CtlError("No eGPU detected. Check the cable and that the eGPU is powered on.")
+        if not conf().get("USE_EGPU") == "1":
+            return f"{gpu_name(d)} is connected (automatic use is off)."
+        card = None
+        for _ in range(20):  # driver + monitor detection
+            card = drm_nodes(d)[0]
+            if card and monitors(card):
+                break
+            time.sleep(0.5)
+        if not card or not monitors(card):
+            return f"{gpu_name(d)} is connected, but no monitor is attached to it."
+        if session_type() == "game" and read(STATE) != "egpu":
+            with Lock():
+                write_user_file(STATE, "egpu\n")
+                restart_game_mode("connect requested")
+            return f"{gpu_name(d)} connected. Game Mode is restarting on the eGPU."
+    return f"{gpu_name(d)} connected."
+
+
+def set_option(key, on):
+    if key == "USE_EGPU":
+        return set_auto(on)
+    if key == "SHADER_SWAP" and not on and conf().get("SHADER_SWAP") == "1":
+        if steam_running():
+            set_conf(key, "0")
+            return "Separate shader caches: off (existing copies are kept)."
+        set_conf(key, "0")
+        return shader_restore()
+    set_conf(key, "1" if on else "0")
+    if key == "AUTO_SWITCH":
+        return f"Switch automatically when plugged in: {'on' if on else 'off'}"
+    return "Separate shader cache per GPU: on (takes effect the next time Game Mode starts)."
+
+
+def set_auto(on):
+    set_conf("USE_EGPU", "1" if on else "0")
+    if session_type() == "game":
+        with Lock():
+            have, want = read(STATE), want_mode()
+            if have and have != want:
+                write_user_file(STATE, want + "\n")
+                restart_game_mode("automatic eGPU use turned " + ("on" if on else "off"))
+    return f"Use eGPU automatically: {'on' if on else 'off'}"
+
+
+def session_env():
+    m = want_mode(have="")
+    print(f"MODE={m}")
+    print(f"PROFILE={profile_for(m)}")
+    d, i = find_egpu(), find_igpu()
+    if m == "egpu":
+        print(f"EGPU_SLOT={os.path.basename(d)}")
+        print(f"EGPU_VK_ID={pci_id(d)}")
+    elif d and i:
+        # eGPU attached but not used: pin games/Steam to the built-in GPU so nothing lands on the eGPU
+        print(f"IGPU_SLOT={os.path.basename(i)}")
+        print(f"IGPU_VK_ID={pci_id(i)}")
+
+
+def wait_boot():
+    c = conf()
+    if want_mode(have="egpu") == "igpu" and (c.get("USE_EGPU") != "1" or read(CHOICE) == "igpu"
+                                             or (c.get("AUTO_SWITCH") != "1" and read(CHOICE) != "egpu")):
+        return
+    if not tb_peripherals():
+        return
+    try:
+        secs = int(c.get("WAIT_SECS", "15"))
+    except ValueError:
+        secs = 15
+    end = time.time() + secs
+    while time.time() < end:
+        if want_mode(have="") == "egpu":
+            return
+        time.sleep(0.5)
+
+
+# ---------------------------------------------------------------- per-GPU shader caches
+# Steam keeps compiled shaders in <library>/steamapps/shadercache and remembers which GPU they were
+# built for in config.vdf ("ShaderCacheManager"). When the GPU changes, Steam re-processes everything.
+# We keep one copy of both per GPU and swap them in before Steam starts.
+def find_igpu():
+    for d in sorted(glob.glob(f"{SYS_PCI}/*")):
+        if (read(f"{d}/class", "") or "").startswith("0x03") and read(f"{d}/boot_vga") == "1":
+            return d
+    return None
+
+
+def pci_id(d):
+    return f"{(read(f'{d}/vendor') or '')[2:]}:{(read(f'{d}/device') or '')[2:]}"
+
+
+def profile_for(mode):
+    if mode == "egpu":
+        d = find_egpu()
+        if d:
+            return "egpu-" + pci_id(d).replace(":", "_")
+    return "igpu"
+
+
+def steam_running():
+    r = subprocess.run(["pgrep", "-u", str(USER.pw_uid), "-x", "steam"], capture_output=True, env=SAFE_ENV)
+    return r.returncode == 0
+
+
+def steam_libraries():
+    libs = [STEAM]
+    vdf = read(os.path.join(STEAM, "steamapps", "libraryfolders.vdf"), "") or ""
+    for m in re.finditer(r'"path"\s+"([^"]+)"', vdf):
+        path = m.group(1).replace("\\\\", "\\")
+        if os.path.realpath(path) != os.path.realpath(STEAM):
+            libs.append(path)
+    return [l for l in libs if os.path.isdir(os.path.join(l, "steamapps"))]
+
+
+def _vdf_block(text, key):
+    """(start, end) of the  "key" { ... }  block (inclusive of its closing brace line)."""
+    m = re.search(rf'^([ \t]*)"{key}"[ \t]*\r?\n\1\{{[ \t]*\r?\n', text, re.M)
+    if not m:
+        return None
+    indent = m.group(1)
+    close = re.compile(rf'^{re.escape(indent)}\}}[ \t]*\r?\n', re.M).search(text, m.end())
+    if not close:
+        return None
+    return m.start(), close.end()
+
+
+def _steam_config():
+    return os.path.join(STEAM, "config", "config.vdf")
+
+
+def save_shader_state(profile):
+    text = read_raw(_steam_config())
+    if text is None:
+        return
+    b = _vdf_block(text, "ShaderCacheManager")
+    if b:
+        os.makedirs(SHADER_DIR, exist_ok=True)
+        write_user_file(os.path.join(SHADER_DIR, f"{profile}.vdf"), text[b[0]:b[1]])
+
+
+def restore_shader_state(profile):
+    saved = read_raw(os.path.join(SHADER_DIR, f"{profile}.vdf"))
+    cfg = _steam_config()
+    text = read_raw(cfg)
+    if not saved or text is None:
+        return
+    b = _vdf_block(text, "ShaderCacheManager")
+    if not b:
+        return
+    new = text[:b[0]] + saved + text[b[1]:]
+    if new == text:
+        return
+    write_user_file(cfg + ".egpu-bak", text)
+    tmp = cfg + ".egpu-tmp"
+    write_user_file(tmp, new)
+    os.replace(tmp, cfg)
+
+
+def read_raw(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _bucket_owner():
+    """Which profile Steam's current shader bucket belongs to (used once, when first enabling)."""
+    text = read_raw(_steam_config()) or ""
+    m = re.search(r'"CurrentBucketGPU"\s+"([^"]*)"', text)
+    d = find_egpu()
+    if not m or not d:
+        return "igpu"
+    try:
+        r = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, env=SAFE_ENV, timeout=15)
+        want = pci_id(d).split(":")[1]
+        for blk in re.split(r"^GPU\d+:", r.stdout, flags=re.M)[1:]:
+            if re.search(rf"deviceID\s*=\s*0x{want}\b", blk):
+                cm = re.search(r"deviceName\s*=.*\(RADV ([^)]+)\)", blk)
+                if cm and cm.group(1) in m.group(1):
+                    return profile_for("egpu")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "igpu"
+
+
+SHADER_LEGACY = os.path.join(INSTALL_DIR, "shader-legacy.json")
+
+
+def _legacy():
+    """The cache that existed before eGPU Manager: built on whatever GPUs ran games until then.
+    {"owner": profile it was filed under, "time": cutoff, "seeded": profiles that got a copy}"""
+    try:
+        d = json.loads(read(SHADER_LEGACY, "") or "{}")
+        return d if isinstance(d.get("owner"), str) and isinstance(d.get("time"), (int, float)) else None
+    except ValueError:
+        return None
+
+
+def _newest(path):
+    newest = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                newest = max(newest, os.lstat(os.path.join(root, f)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def _is_legacy(game_dir, leg):
+    return bool(leg) and _newest(game_dir) <= leg["time"]
+
+
+def _seed_from_legacy(sa, profile, leg):
+    """Give a new GPU profile the pre-setup shaders as hard links (no extra disk space). They were
+    built on both GPUs before the caches were split, and Mesa keys every entry by GPU, so each GPU
+    finds its own entries and ignores the other's."""
+    src, dst = os.path.join(sa, f"shadercache.{leg['owner']}"), os.path.join(sa, f"shadercache.{profile}")
+    if not os.path.isdir(src):
+        return
+    for g in os.listdir(src):
+        sg, dg = os.path.join(src, g), os.path.join(dst, g)
+        if g.isdigit() and os.path.isdir(sg) and not os.path.exists(dg) and _is_legacy(sg, leg):
+            subprocess.run(["cp", "-al", "--", sg, dg], env=SAFE_ENV, capture_output=True)
+
+
+def shader_swap(profile):
+    """Point every Steam library's shadercache at <profile>'s copy. Steam must not be running."""
+    if conf().get("SHADER_SWAP") != "1":
+        return "Separate shader caches are off."
+    if steam_running():
+        raise CtlError("Steam is running; the shader cache switches the next time Game Mode starts.")
+    current = read(SHADER_CUR)
+    if not current:
+        current = _bucket_owner()
+    done, seeded = [], set()
+    for lib in steam_libraries():
+        sa = os.path.join(lib, "steamapps")
+        sc = os.path.join(sa, "shadercache")
+        target = f"shadercache.{profile}"
+        if os.path.islink(sc):
+            if not re.fullmatch(r"shadercache\.[\w.-]+", os.readlink(sc)):
+                log(f"{sc} is a custom symlink; leaving it alone")
+                continue
+            if os.readlink(sc) == target:
+                continue
+        elif os.path.isdir(sc):  # first time: the existing cache belongs to the current profile
+            keep = os.path.join(sa, f"shadercache.{current}")
+            if os.path.exists(keep):
+                log(f"{keep} already exists; leaving {sc} alone")
+                continue
+            os.rename(sc, keep)
+            if not _legacy():
+                write_user_file(SHADER_LEGACY, json.dumps({"owner": current, "time": time.time(), "seeded": [current]}))
+        os.makedirs(os.path.join(sa, target), exist_ok=True)
+        leg = _legacy()
+        if leg and profile not in leg.get("seeded", []):
+            _seed_from_legacy(sa, profile, leg)
+            seeded.add(profile)
+        tmp = sc + ".egpu-tmp"
+        remove_file(tmp)
+        os.symlink(target, tmp)
+        os.replace(tmp, sc)
+        done.append(lib)
+    leg = _legacy()
+    if leg and seeded:
+        leg["seeded"] = sorted(set(leg.get("seeded", [])) | seeded)
+        write_user_file(SHADER_LEGACY, json.dumps(leg))
+    if current != profile:
+        save_shader_state(current)
+        restore_shader_state(profile)
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    write_user_file(SHADER_CUR, profile + "\n")
+    if done or current != profile:
+        log(f"shader cache: {current} -> {profile}")
+    return f"Shader cache: {profile}"
+
+
+def shader_restore():
+    """Undo shader swapping: the active profile's cache becomes the plain shadercache folder again."""
+    if steam_running():
+        raise CtlError("Close Steam first (switch to Desktop Mode and exit Steam).")
+    for lib in steam_libraries():
+        sc = os.path.join(lib, "steamapps", "shadercache")
+        if os.path.islink(sc) and re.fullmatch(r"shadercache\.[\w.-]+", os.readlink(sc)):
+            real = os.path.join(lib, "steamapps", os.readlink(sc))
+            os.remove(sc)
+            os.rename(real, sc)
+    remove_file(SHADER_CUR)
+    return "Shader caches merged back into Steam's normal folder (other GPUs' copies kept)."
+
+
+def _du(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def shader_info():
+    profiles = {}
+    for lib in steam_libraries():
+        for p in glob.glob(os.path.join(lib, "steamapps", "shadercache.*")):
+            name = p.rsplit("shadercache.", 1)[1]
+            if name.endswith("egpu-tmp"):
+                continue
+            profiles[name] = profiles.get(name, 0) + _du(p)
+    return {"active": read(SHADER_CUR), "enabled": conf().get("SHADER_SWAP") == "1",
+            "profiles": [{"name": k, "bytes": v} for k, v in sorted(profiles.items())]}
+
+
+def _game_names():
+    """appid -> name, from Steam app manifests and non-Steam shortcuts."""
+    names = {}
+    for lib in steam_libraries():
+        for m in glob.glob(os.path.join(lib, "steamapps", "appmanifest_*.acf")):
+            t = read(m, "") or ""
+            a, n = re.search(r'"appid"\s+"(\d+)"', t), re.search(r'"name"\s+"([^"]+)"', t)
+            if a and n:
+                names[a.group(1)] = n.group(1)
+    for sc in glob.glob(os.path.join(STEAM, "userdata", "*", "config", "shortcuts.vdf")):
+        try:
+            raw = open(sc, "rb").read()
+        except OSError:
+            continue
+        for ent in re.split(rb"\x00\d+\x00(?=\x02appid\x00)", raw):
+            a = re.search(rb"\x02appid\x00(.{4})", ent, re.S)
+            n = re.search(rb"\x01appname\x00([^\x00]*)\x00", ent, re.I)
+            if a and n:
+                names[str(int.from_bytes(a.group(1), "little"))] = n.group(1).decode("utf-8", "replace")
+    return names
+
+
+def _game_dirs():
+    """(appid, label, path, bytes) for every per-game cache. label is the GPU profile, or "legacy"
+    for shaders from before the caches were split (built on both GPUs, can't be told apart)."""
+    leg, out = _legacy(), []
+    for lib in steam_libraries():
+        sa = os.path.join(lib, "steamapps")
+        dirs = [(p.rsplit("shadercache.", 1)[1], p) for p in glob.glob(os.path.join(sa, "shadercache.*"))
+                if not p.endswith("egpu-tmp") and not os.path.islink(p)]
+        real = os.path.join(sa, "shadercache")
+        if os.path.isdir(real) and not os.path.islink(real):   # swapping off / never swapped
+            dirs.append(("legacy", real))
+        for prof, p in dirs:
+            for g in os.listdir(p):
+                gp = os.path.join(p, g)
+                if g.isdigit() and os.path.isdir(gp):
+                    out.append((g, "legacy" if prof == "legacy" or _is_legacy(gp, leg) else prof, gp, _du(gp)))
+    return out
+
+
+def shader_games():
+    """Per-game shader caches: [{appid, name, sizes: {label: bytes}}], biggest first."""
+    games = {}
+    for appid, label, _, size in _game_dirs():
+        sizes = games.setdefault(appid, {})
+        # hard-linked legacy copies share their disk space: count them once
+        sizes[label] = max(sizes.get(label, 0), size) if label == "legacy" else sizes.get(label, 0) + size
+    names = _game_names()
+    out = [{"appid": a, "name": names.get(a, f"Unknown game ({a})"), "sizes": s} for a, s in games.items()]
+    out.sort(key=lambda g: -sum(g["sizes"].values()))
+    return {"active": read(SHADER_CUR), "games": out}
+
+
+def shader_delete(appid, label):
+    """Delete one game's shaders for one label (GPU profile or "legacy"), or "all"."""
+    if not appid.isdigit() or not re.fullmatch(r"all|legacy|igpu|igpu\+legacy|egpu-[0-9a-f]{4}_[0-9a-f]{4}", label):
+        raise CtlError("invalid request")
+    freed, legacy = 0, 0
+    for a, lab, path, size in _game_dirs():
+        if a == appid and (label in ("all", lab) or (label == "igpu+legacy" and lab in ("igpu", "legacy"))):
+            if lab == "legacy":
+                legacy = max(legacy, size)   # hard-linked copies share their space
+            else:
+                freed += size
+            shutil.rmtree(path, ignore_errors=True)
+    freed += legacy
+    if not freed:
+        raise CtlError("No shaders to delete.")
+    return f"Deleted {freed / 1e9:.1f} GB of shaders." if freed >= 1e8 else f"Deleted {freed / 1e6:.0f} MB of shaders."
+
+
+BACKLIGHT_SAVE = os.path.join(INSTALL_DIR, "backlight")
+
+
+def _internal_backlight():
+    i = find_igpu()
+    for b in sorted(glob.glob("/sys/class/backlight/*")):
+        if i and os.path.realpath(b).startswith(os.path.realpath(i) + "/"):
+            return b
+    return None
+
+
+def backlight(action):
+    """Turn the built-in screen's backlight off while Game Mode runs on the eGPU (gamescope then
+    only drives the eGPU, so nothing else switches the handheld panel off), and restore it after."""
+    b = _internal_backlight()
+    if not b:
+        return "No built-in screen backlight found."
+    f = os.path.join(b, "brightness")
+    if action == "off":
+        cur = read(f)
+        if cur and cur != "0":
+            write_user_file(BACKLIGHT_SAVE, cur + "\n")
+        with open(f, "w") as fh:
+            fh.write("0")
+        return "Built-in screen off."
+    saved = read(BACKLIGHT_SAVE)
+    if saved and saved.isdigit():
+        with open(f, "w") as fh:
+            fh.write(saved)
+        remove_file(BACKLIGHT_SAVE)
+        return "Built-in screen restored."
+    return "Built-in screen unchanged."
+
+
+# ---------------------------------------------------------------- Desktop Mode
+def desktop_env():
+    """Shell lines for Plasma's startup: make the eGPU KWin's main GPU when it drives the monitor."""
+    # DRI_PRIME names the eGPU explicitly: "DRI_PRIME=1" means "not the compositor's GPU", which
+    # flips apps onto the iGPU once KWin itself runs on the eGPU (every window copied over USB4).
+    out = []
+    d, i = find_egpu(), find_igpu()
+    use = conf().get("USE_EGPU") == "1" and read(CHOICE) != "igpu"
+    if use and d and not device_lost(d) and drm_nodes(d)[0]:
+        out.append("export DRI_PRIME=pci-" + re.sub(r"[:.]", "_", os.path.basename(d)))
+        ecard, icard = drm_nodes(d)[0], (drm_nodes(i)[0] if i else None)
+        if icard and monitors(ecard):
+            out.append(f"export KWIN_DRM_DEVICES=/dev/dri/{os.path.basename(ecard)}:/dev/dri/{os.path.basename(icard)}")
+    for _ in range(50):     # the Decky plugin turns the handheld panel back on once Game Mode ends
+        if not os.path.exists("/run/egpu-manager-edp-off"):
+            break
+        time.sleep(0.1)
+    try:   # Steam's leaked shared memory from killed sessions (see egpu-gamescope-session)
+        if subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "steam"], capture_output=True, env=SAFE_ENV).returncode:
+            for f in glob.glob(f"/dev/shm/u{os.getuid()}-Shm_*"):
+                remove_file(f)
+    except OSError:
+        pass
+    try:
+        backlight("restore")   # KWin manages the panel in Desktop Mode
+    except OSError as e:
+        log(f"backlight not restored: {e}")
+    try:
+        mode = "egpu" if (use and d and drm_nodes(d)[0]) else "igpu"
+        if conf().get("SHADER_SWAP") == "1":
+            shader_swap(profile_for(mode))
+    except (CtlError, OSError) as e:
+        log(f"shader cache not switched: {e}")
+    return "\n".join(out)
+
+
+def switch(target):
+    if target == "egpu":
+        d = find_egpu()
+        if not d or device_lost(d) or not drm_nodes(d)[0]:
+            raise CtlError("No working eGPU is connected.")
+        if not monitors(drm_nodes(d)[0]):
+            raise CtlError("Connect a monitor to the eGPU first.")
+    write_user_file(CHOICE, target + "\n")
+    sess = session_type()
+    if sess == "game":
+        with Lock():
+            if read(STATE) != target:
+                write_user_file(STATE, target + "\n")
+                restart_game_mode(f"switch to {target} requested")
+                return "Switching Game Mode to the " + ("eGPU..." if target == "egpu" else "built-in screen...")
+        return "Already on the " + ("eGPU." if target == "egpu" else "built-in screen.")
+    if sess == "desktop":
+        return "Saved. Game Mode will use the " + ("eGPU." if target == "egpu" else "built-in screen.") + \
+               " Log out of Desktop Mode to apply it here too."
+    return "Saved."
+
+
+# ---------------------------------------------------------------- first-time setup / doctor
+def _check(cid, status, label, detail="", fix=None):
+    return {"id": cid, "status": status, "label": label, "detail": detail, "fix": fix}
+
+
+def doctor():
+    """Checks a setup end to end. status: ok | warn | fail | info. fix: action the UI can offer."""
+    out = []
+    osr = read("/etc/os-release", "") or ""
+    osid = re.search(r"^ID=(.*)$", osr, re.M)
+    ver = re.search(r"^VERSION_ID=(.*)$", osr, re.M)
+    out.append(_check("os", "ok" if osid and "steamos" in osid.group(1) else "warn",
+                      "SteamOS " + (ver.group(1) if ver else "") if osid and "steamos" in osid.group(1)
+                      else "Not SteamOS (untested)"))
+
+    domains = glob.glob(f"{SYS_TB}/domain*")
+    tbs = tb_peripherals()
+    d = find_egpu()
+    if pciehp_stuck() or (d and device_lost(d)):
+        out.append(_check("stuck", "fail", "eGPU was unplugged while in use",
+                          "Linux can't reattach it until a reboot.", "reboot"))
+        return out
+    if not domains and not d:
+        out.append(_check("usb4", "fail", "No USB4 / Thunderbolt controller found",
+                          "This device may not support eGPUs over USB-C."))
+    elif domains:
+        sec = read(f"{domains[0]}/security", "?")
+        out.append(_check("usb4", "ok", "USB4 / Thunderbolt controller", f"security level: {sec}"))
+
+    if domains:
+        if not tbs:
+            out.append(_check("dock", "fail" if not d else "info", "No eGPU dock connected" if not d else "Dock",
+                              "Plug the dock into the USB4 port (on the Legion Go S: the top USB-C port) "
+                              "and power it on." if not d else "connected over PCIe directly"))
+        for t in tbs:
+            name = " ".join(x for x in (read(f"{t}/vendor_name"), read(f"{t}/device_name")) if x)
+            if read(f"{t}/device_name", "").startswith(read(f"{t}/vendor_name", "\0")):
+                name = read(f"{t}/device_name")
+            if read(f"{t}/authorized") != "1":
+                out.append(_check("auth", "fail", f"{name}: not authorized",
+                                  "USB4 security blocks the dock until it is approved.", "authorize"))
+            else:
+                out.append(_check("auth", "ok", f"Dock: {name}", "authorized"))
+            gbps = _gbps(read(f"{t}/rx_speed"), read(f"{t}/rx_lanes"))
+            if gbps is not None:
+                if gbps < 40:
+                    out.append(_check("speed", "warn", f"USB4 link: {gbps:g} Gb/s",
+                                      "Expected 40 Gb/s. Use the short USB4/TB cable that came with the dock, "
+                                      "and the handheld's USB4 port."))
+                else:
+                    out.append(_check("speed", "ok", f"USB4 link: {gbps:g} Gb/s"))
+
+    if not d:
+        if tbs:
+            out.append(_check("gpu", "fail", "Dock found but no graphics card",
+                              "Check the card is seated and the dock's power supply is on, then press Connect.",
+                              "connect"))
+        return out + [_integration_check()]
+    name = gpu_name(d)
+    vendor = read(f"{d}/vendor")
+    drv = os.path.basename(os.path.realpath(f"{d}/driver")) if os.path.exists(f"{d}/driver") else None
+    if vendor == "0x10de":
+        out.append(_check("gpu", "fail", f"{name}: NVIDIA",
+                          "NVIDIA cards are not supported in SteamOS Game Mode (no driver on SteamOS). "
+                          "Use an AMD Radeon card."))
+    elif not drv or not drm_nodes(d)[0]:
+        out.append(_check("gpu", "fail", f"{name}: driver did not load",
+                          "Check `journalctl -k | grep amdgpu`. The card may need a newer SteamOS."))
+    else:
+        out.append(_check("gpu", "ok", name, f"driver: {drv}"))
+        link, mx = pcie_link(d), read(f"{d}/max_link_width")
+        out.append(_check("pcie", "ok" if link else "info", f"PCIe link: {link or 'unknown'}"))
+        mons = monitors(drm_nodes(d)[0])
+        if mons:
+            out.append(_check("monitor", "ok", "Monitor: " + ", ".join(m["name"] for m in mons)))
+        else:
+            out.append(_check("monitor", "warn", "No monitor on the eGPU",
+                              "Plug the monitor/TV into the graphics card itself, not into the handheld."))
+    out.append(_integration_check())
+    return out
+
+
+def _integration_check():
+    inst = read(os.path.join(INSTALL_DIR, "VERSION"))
+    if not os.path.exists(DROPIN) or not inst:
+        return _check("integration", "fail", "Game Mode integration not installed",
+                      "Needed so Game Mode and Desktop Mode use the eGPU.", "install")
+    if inst != VERSION:
+        return _check("integration", "warn", f"Integration {inst} is older than {VERSION}", "", "install")
+    return _check("integration", "ok", f"Integration {inst} installed")
+
+
+def authorize_docks():
+    for t in tb_peripherals():
+        if read(f"{t}/authorized") == "1":
+            continue
+        uuid = read(f"{t}/unique_id")
+        if uuid and re.fullmatch(r"[0-9a-fA-F-]{8,64}", uuid):
+            # Enroll with bolt so it is trusted automatically next time; fall back to a one-off approval.
+            r = subprocess.run(["boltctl", "enroll", "--policy", "auto", uuid],
+                               capture_output=True, text=True, env=SAFE_ENV)
+            if r.returncode == 0:
+                continue
+        with open(f"{t}/authorized", "w") as f:
+            f.write("1")
+
+
+def install_decky_plugin(src):
+    """Copy a built plugin folder into Decky's plugin directory and restart Decky (root)."""
+    import shutil
+    src = os.path.realpath(src)
+    manifest = read_raw(os.path.join(src, "plugin.json")) or ""
+    if '"eGPU Manager"' not in manifest or not os.path.isfile(os.path.join(src, "dist", "index.js")):
+        raise CtlError(f"{src} is not a built eGPU Manager plugin")
+    plugins = os.path.join(HOME, "homebrew", "plugins")
+    if not os.path.isdir(plugins):
+        raise CtlError("Decky Loader is not installed (see https://decky.xyz), then run setup again.")
+    dest = os.path.join(plugins, "eGPU Manager")
+    if os.path.realpath(dest) == src:
+        return 0
+    tmp = dest + ".new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copytree(src, tmp, symlinks=False, ignore=shutil.ignore_patterns("node_modules", "src", "out", "*.map"))
+    shutil.rmtree(dest, ignore_errors=True)
+    os.rename(tmp, dest)
+    subprocess.run(["systemctl", "restart", "plugin_loader.service"], env=SAFE_ENV)
+    return 0
+
+
+# ---------------------------------------------------------------- hardware report
+REPO = "avishai0258/steamos-egpu-manager"
+REPORT_FILE = os.path.join(HOME, "egpu-manager-report.md")
+
+
+def report(kind="works"):
+    """A shareable hardware report (no serial numbers or user names) plus a prefilled GitHub issue URL."""
+    import urllib.parse
+    st = status()
+    dmi = lambda k: (read(f"/sys/class/dmi/id/{k}", "") or "").strip()
+    osr = read("/etc/os-release", "") or ""
+    ver = re.search(r'^VERSION_ID="?([^"\n]*)', osr, re.M)
+    i = find_igpu()
+    gpu, itf = st.get("gpu") or {}, st.get("interface") or {}
+    lines = [
+        f"- **Handheld:** {dmi('sys_vendor')} {dmi('product_version') or dmi('product_name')} (BIOS {dmi('bios_version')})",
+        f"- **SteamOS:** {ver.group(1) if ver else '?'} · kernel {os.uname().release}",
+        f"- **Built-in GPU:** {gpu_name(i) if i else '?'}",
+        f"- **eGPU:** {gpu.get('name', 'not detected')} ({gpu.get('id', '?')}) · PCIe {gpu.get('link', '?')}",
+        f"- **Connection:** {itf.get('label', '?')} · dock chip: {itf.get('device', '?')}",
+        f"- **Monitor on eGPU:** {', '.join(m['name'] for m in st.get('monitors') or []) or 'none'}",
+        f"- **eGPU Manager:** {VERSION} · auto switch {'on' if st.get('auto_switch') else 'off'} · shader swap {'on' if st.get('shader_swap') else 'off'}",
+    ]
+    checks = []
+    try:
+        for c in doctor():
+            checks.append(f"- [{c['status']}] {c['label']}" + (f" — {c['detail']}" if c.get("detail") else ""))
+    except Exception as e:
+        checks.append(f"- doctor failed: {e}")
+    log_lines = []
+    try:
+        r = subprocess.run(["journalctl", "--user", "-b", "--no-pager", "-o", "short", "-g", "egpu-auto"],
+                           capture_output=True, text=True, env=SAFE_ENV, timeout=20)
+        log_lines = [re.sub(r"^\S+ \S+ \S+ \S+ ", "", l) for l in r.stdout.splitlines()[-40:]]
+    except Exception:
+        pass
+    k = subprocess.run(["journalctl", "-k", "-b", "--no-pager", "-o", "short-monotonic", "-g",
+                        "amdgpu 0000:[0-9a-f]+:00.0.*(error|fail|lost)|pciehp|thunderbolt.*(disconnect|error)"],
+                       capture_output=True, text=True, env=SAFE_ENV, timeout=20).stdout.splitlines()[-15:]
+    k = [re.sub(r"^(\[[^]]+\]) \S+ kernel: ", r"\1 ", l) for l in k]   # drop the host name
+    title = ("Works: " if kind == "works" else "Problem: ") + \
+        f"{dmi('product_version') or dmi('product_name')} + {gpu.get('name', 'eGPU')} ({itf.get('label', '?')})"
+    body = "\n".join(
+        (["**It works for me.**"] if kind == "works" else ["**What went wrong:** <!-- describe it here -->"]) +
+        ["", "### Hardware"] + lines + ["", "### Setup check"] + checks +
+        ["", "<details><summary>Log</summary>", "", "```"] + log_lines + k + ["```", "</details>"])
+    with open(REPORT_FILE, "w") as f:
+        f.write(f"# {title}\n\n{body}\n")
+    short = body if len(body) < 6000 else body[:6000] + "\n```\n(log cut: full report in ~/egpu-manager-report.md)"
+    url = f"https://github.com/{REPO}/issues/new?" + urllib.parse.urlencode(
+        {"title": title, "body": short, "labels": "hardware-works" if kind == "works" else "bug"})
+    return {"ok": True, "title": title, "body": body, "url": url, "file": REPORT_FILE}
+
+
+def uninstall_decky_plugin():
+    import shutil
+    dest = os.path.join(HOME, "homebrew", "plugins", "eGPU Manager")
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+        subprocess.run(["systemctl", "restart", "plugin_loader.service"], env=SAFE_ENV)
+    return 0
+
+
+# ---------------------------------------------------------------- privileged
+def main_priv(args):
+    if not IS_ROOT:
+        raise CtlError("must run as root")
+    if args[:1] == ["_authorize"]:
+        authorize_docks()
+        return 0
+    if args[:1] == ["_setup"] and len(args) == 2:
+        # First-time setup in one password prompt: approve the dock, install the Decky plugin.
+        authorize_docks()
+        return install_decky_plugin(args[1])
+    if args[:1] == ["_install-plugin"] and len(args) == 2:
+        return install_decky_plugin(args[1])
+    if args[:1] == ["_uninstall-plugin"]:
+        return uninstall_decky_plugin()
+    if args[:1] == ["_rescan"]:
+        with open("/sys/bus/pci/rescan", "w") as f:
+            f.write("1")
+        return 0
+    if args[:1] == ["_remove"] and len(args) == 2:
+        slot = args[1]
+        d = f"{SYS_PCI}/{slot}"
+        if not SLOT_RE.match(slot) or not os.path.isdir(d):
+            raise CtlError(f"invalid device {slot}")
+        if not (read(f"{d}/class", "") or "").startswith("0x03") or read(f"{d}/boot_vga") == "1":
+            raise CtlError(f"{slot} is not an external GPU")
+        base = slot.rsplit(".", 1)[0]
+        funcs = sorted(glob.glob(f"{SYS_PCI}/{base}.*"), reverse=True)  # audio (.1) before GPU (.0)
+        for fn in funcs:
+            if os.path.exists(f"{fn}/remove"):
+                with open(f"{fn}/remove", "w") as f:
+                    f.write("1")
+        return 0
+    raise CtlError("unknown privileged command")
+
+
+# ---------------------------------------------------------------- CLI
+def main(argv):
+    cmd = argv[0] if argv else "status"
+    as_json = "--json" in argv
+    try:
+        if cmd.startswith("_"):
+            return main_priv(argv)
+        if cmd == "status":
+            st = status()
+            print(json.dumps(st) if as_json else status_text(st))
+            return 0
+        if cmd == "mode":
+            print(want_mode())
+            return 0
+        if cmd == "session-env":
+            session_env()
+            return 0
+        if cmd == "wait-boot":
+            wait_boot()
+            return 0
+        if cmd == "sync":
+            sync(settle="--settle" in argv)
+            return 0
+        if cmd in ("connect", "disconnect"):
+            msg = connect() if cmd == "connect" else disconnect()
+        elif cmd == "restart":
+            msg = restart_session()
+        elif cmd == "switch" and len(argv) > 1 and argv[1] in ("egpu", "igpu"):
+            msg = switch(argv[1])
+        elif cmd == "set" and len(argv) > 2 and argv[1] in ("USE_EGPU", "AUTO_SWITCH", "SHADER_SWAP") \
+                and argv[2] in ("on", "off"):
+            msg = set_option(argv[1], argv[2] == "on")
+        elif cmd == "shader-swap" and len(argv) > 1:
+            t = argv[1]
+            prof = profile_for("egpu" if t == "egpu" or (t == "desktop" and find_egpu()) else "igpu") \
+                if t in ("egpu", "igpu", "desktop") else t
+            if not re.fullmatch(r"(igpu|egpu-[0-9a-f]{4}_[0-9a-f]{4})", prof):
+                raise CtlError("invalid profile")
+            msg = shader_swap(prof)
+        elif cmd == "shader-restore":
+            msg = shader_restore()
+        elif cmd == "shader-games":
+            print(json.dumps(shader_games()))
+            return 0
+        elif cmd == "shader-delete" and len(argv) > 2:
+            msg = shader_delete(argv[1], argv[2])
+        elif cmd == "shader-info":
+            print(json.dumps(shader_info()) if as_json else json.dumps(shader_info(), indent=1))
+            return 0
+        elif cmd == "doctor":
+            res = doctor()
+            if as_json:
+                print(json.dumps(res))
+            else:
+                icon = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]", "info": "[INFO]"}
+                for c in res:
+                    print(f"{icon[c['status']]} {c['label']}" + (f"\n       {c['detail']}" if c["detail"] else ""))
+            return 0
+        elif cmd == "authorize":
+            priv("_authorize")
+            msg = "Dock authorized."
+        elif cmd == "backlight" and len(argv) > 1 and argv[1] in ("off", "restore"):
+            try:
+                msg = backlight(argv[1])
+            except OSError as e:
+                raise CtlError(f"Can't change the backlight: {e}")
+        elif cmd == "report":
+            r = report(argv[1] if len(argv) > 1 and argv[1] in ("works", "problem") else "works")
+            print(json.dumps(r) if as_json else f"{r['title']}\n\n{r['body']}\n\nSaved to {r['file']}\nShare it: {r['url'][:80]}...")
+            return 0
+        elif cmd == "desktop-env":
+            print(desktop_env())
+            return 0
+        elif cmd == "auto" and len(argv) > 1 and argv[1] in ("on", "off"):
+            msg = set_auto(argv[1] == "on")
+        elif cmd in ("version", "--version"):
+            print(VERSION)
+            return 0
+        else:
+            print(__doc__)
+            return 2
+        print(json.dumps({"ok": True, "message": msg}) if as_json else msg)
+        return 0
+    except CtlError as e:
+        if as_json:
+            print(json.dumps({"ok": False, "message": str(e)}))
+        else:
+            print(str(e), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

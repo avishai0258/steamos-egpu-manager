@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=eGPU Manager
+Comment=Connect or safely disconnect your external GPU
+Exec=@HOME@/.local/share/egpu-auto/egpu-desktop
+Icon=video-display
+Terminal=false
+Categories=System;Settings;
