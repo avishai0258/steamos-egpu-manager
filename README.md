@@ -1,12 +1,19 @@
 # eGPU Manager for SteamOS
 
+<a href="https://www.buymeacoffee.com/Avishai0258"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
+
 **Plug-and-play external GPU for SteamOS handhelds.** Plug in your eGPU and Game Mode, Big Picture and your games run on it, on your TV or monitor. Unplug it and you're back on the handheld screen. Each GPU keeps its own shaders, so switching never rebuilds them.
 
 Comes as a **Decky plugin** (Game Mode) and a **Desktop Mode app**, with a one-click installer and a one-click uninstaller.
 
 <p align="center"><img src="docs/promo/1-hero.png" width="100%" alt="eGPU Manager"></p>
 
-<!-- SCREENSHOTS -->
+<p align="center">
+  <img src="docs/images/plugin-main.png" width="31%" alt="Main page">
+  <img src="docs/images/plugin-shaders.png" width="31%" alt="Shaders page">
+  <img src="docs/images/plugin-settings.png" width="31%" alt="Settings page">
+</p>
+<p align="center"><sub>The Decky plugin in the Quick Access menu: status & actions · shaders per game and GPU · settings & sharing</sub></p>
 
 > ⚠️ **Early release, tested on one setup so far** (see [Tested hardware](#tested-hardware)). It only changes files in your home folder and can be fully removed with **Uninstall**. If it works for you, please press **It works: share my hardware** in the plugin, so others know what works.
 
@@ -105,6 +112,10 @@ Settings are in `~/.config/egpu-auto.conf` (`USE_EGPU`, `AUTO_SWITCH`, `SHADER_S
 ```bash
 cd decky && pnpm install && ./package.sh   # -> decky/out/eGPU-Manager.zip
 ```
+
+## Support
+
+If eGPU Manager saved you some hassle, you can [buy me a coffee ☕](https://www.buymeacoffee.com/Avishai0258). Sharing your hardware result with the **It works** button helps just as much.
 
 ## License
 

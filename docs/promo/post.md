@@ -23,4 +23,4 @@ AMD cards only (NVIDIA isn't supported on SteamOS).
 
 GitHub + download: https://github.com/avishai0258/steamos-egpu-manager
 
-Feedback welcome!
+Feedback welcome! If it helps you, you can buy me a coffee: https://www.buymeacoffee.com/Avishai0258
