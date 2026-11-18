@@ -41,7 +41,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 SELF = os.path.realpath(__file__)
 SYS_PCI = "/sys/bus/pci/devices"
 SYS_TB = "/sys/bus/thunderbolt/devices"
@@ -997,7 +997,9 @@ def desktop_env():
     # flips apps onto the iGPU once KWin itself runs on the eGPU (every window copied over USB4).
     out = []
     d, i = find_egpu(), find_igpu()
-    use = conf().get("USE_EGPU") == "1" and read(CHOICE) != "igpu"
+    # The Game Mode "handheld screen" choice does not apply here: Desktop shows both screens, and
+    # compositing on the iGPU while the TV hangs off the eGPU copies every frame over USB4 (slow).
+    use = conf().get("USE_EGPU") == "1"
     if use and d and not device_lost(d) and drm_nodes(d)[0]:
         out.append("export DRI_PRIME=pci-" + re.sub(r"[:.]", "_", os.path.basename(d)))
         ecard, icard = drm_nodes(d)[0], (drm_nodes(i)[0] if i else None)
